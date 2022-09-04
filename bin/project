@@ -1,0 +1,350 @@
+#!/bin/bash
+# shellcheck disable=1091,2155,2068,2086
+
+source "${BASH_SOURCE%/*}/.helpers.sh"
+source "${BASH_SOURCE%/*}/scripts/deps-check.sh"
+
+set -e
+
+ensure_pwd_is_top_level
+
+export GIT_USER_ID=danicc097
+export GIT_REPO_ID=openapi-go-gin-postgres-sqlc
+export GO_POST_PROCESS_FILE="/usr/bin/env gofmt -w -s"
+export GENVERS=6.0.1
+
+PWD="$(pwd)"
+ENV_FILE=".env"
+BIN_DIR=$(dirname "$0")
+SQLITE_REPO="internal/repos/sqlite"
+
+MAX_COMMENT_LEN=88
+
+# Check build dependencies are met.
+x.check-build-deps() {
+  local -i fails
+  check.column || { ((fails++)) && true; }
+  check.bash || { ((fails++)) && true; }
+  check.go || { ((fails++)) && true; }
+  check.curl || { ((fails++)) && true; }
+  check.direnv || { ((fails++)) && true; }
+  check.yq || { ((fails++)) && true; }
+  check.pg_format || { ((fails++)) && true; }
+  ((fails == 0)) && echo "${GREEN}🎉 All build dependencies met.${OFF}"
+  { ((fails != 0)) && err "${RED}❌ Missing dependencies.${OFF}"; } || true
+}
+
+# Check dependencies and fetch required tools.
+x.bootstrap() {
+  x.check-build-deps
+  echo hello
+  x.install-tools
+}
+
+# Install go libraries as runnable programs.
+x.install-tools() {
+  set -o errexit -eo pipefail
+
+  go install -tags 'sqlite3' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.15.2
+  go install github.com/kyleconroy/sqlc/cmd/sqlc@v1.15.0
+  go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.47.2
+  go install github.com/joho/godotenv/cmd/godotenv@latest
+  go install github.com/wailsapp/wails/v2/cmd/wails@latest
+}
+
+# Generate type-safe Go code from SQL.
+x.generate.sqlc() {
+  { cd $SQLITE_REPO && sqlc generate && cd -; } || err "Failed sqlc generation"
+}
+
+# Run all codegen and postgen commands for the project.
+x.generate() {
+  echo "${MAGENTA}${BOLD}Running codegen and postgen...${OFF}"
+
+  go generate ./... &
+  x.generate.sqlc &
+  wait
+}
+
+# Lints the entire project.
+x.lint() {
+  x.lint.sql
+}
+
+# Formats SQL files.
+x.lint.sql() {
+  SQL_DIRS=(
+    "$SQLITE_REPO/queries"
+    "db/migrations"
+  )
+  for slq_dir in ${SQL_DIRS[@]}; do
+    pg_format \
+      --spaces 2 \
+      --wrap-limit 88 \
+      --function-case 2 \
+      --keyword-case 1 \
+      --placeholder "sqlc\\.(arg|narg)\\(:?[^)]*\\)" \
+      --inplace \
+      $(find "$slq_dir" -maxdepth 1 -name '*.sql')
+  done
+}
+
+# Test the entire project. Accepts `go test` parameters.
+# Args: [...]
+x.test() {
+  x.generate
+  godotenv -f "$ENV_FILE" go test $@ ./...
+}
+
+# Build GUI for Windows.
+x.wails.build() {
+  x.lint
+  x.test ""
+  cd ui && wails build -platform windows/amd64 && cd -
+}
+
+# Develop wails UI.
+x.wails.dev() {
+  # x.lint
+  # x.test ""
+  cd ui && wails dev
+}
+
+# Wrapper for golang-migrate with predefined configuration.
+# TODO golang-migrate also handles sqlite
+# https://github.com/golang-migrate/migrate/tree/master/database/sqlite3
+x.migrate() {
+  (
+    source "$ENV_FILE"
+    migrate \
+      -path db/migrations/
+    # ...
+  )
+}
+
+# Creates a new migration file with the given `name`.
+# Args: name
+x.migrate.create-migration() {
+  tmp="$*"
+  tmp="${tmp// /_}"
+  name="${tmp,,}"
+  [[ -z $name ]] && err "Please provide a migration name"
+  x.migrate create -ext sql -dir db/migrations/ "$name"
+}
+
+usage() (
+  command_comments_parser() {
+    head -$((${lns[$i]} - 1)) $0 |
+      tac |
+      sed -n '/#/!q;p' |
+      tac |
+      awk '{$1=$1;print}'
+  }
+
+  command_opts_comments_parser() {
+    tail -n +$((${lns[$i]} + 1)) $0 |
+      sed -n '/^[[:blank:]]*#/!q;p' |
+      awk '{$1=$1;print}'
+  }
+
+  construct_column() {
+    comment_parser="$1"
+    for i in ${!lns[@]}; do
+      comment_paragraph="$($comment_parser)"
+      ROWS["${rows[$i]}"]="$comment_paragraph"
+      mapfile -t comments <<<"${ROWS[${rows[$i]}]}"
+      for comment in "${comments[@]}"; do
+        comment="$(clean_comment "$comment")"
+        args="-"
+        if [[ ${comment,,} == args:* ]]; then
+          args=$(clean_args "$comment")
+        fi
+        ROW_ARGS[${rows[$i]}]="$args"
+      done
+    done
+
+    for i in "${!rows[@]}"; do
+      mapfile -t comments <<<"${ROWS[${rows[$i]}]}"
+      for j in "${!comments[@]}"; do
+        comment="$(clean_comment "${comments[$j]}")"
+        if [[ ${comment,,} == args:* ]]; then
+          continue
+        fi
+
+        if [[ $j = 0 ]]; then
+          docs+=("$(
+            printf -- "%s\t%s\t%s" \
+              "${rows[$i]}" \
+              "${ROW_ARGS[${rows[$i]}]}" \
+              "$comment"
+          )")
+          continue
+        fi
+
+        docs+=("$(
+          printf -- "%s\t%s\t%s" \
+            "" \
+            "" \
+            "$comment"
+        )")
+      done
+    done
+
+    column -t \
+      --separator $'\t' \
+      --output-width 150 \
+      --table-noextreme C2 \
+      --table-noheadings \
+      --table-wrap C3 \
+      --table-columns C1,C2,C3 < <(printf "    %s\n" "${docs[@]}")
+  }
+
+  declare -A ROWS ROW_ARGS
+  declare docs rows X_FLAGS
+
+  for c in "${COMMANDS[@]}"; do
+    shopt -s extdebug
+    lns+=("$(declare -F x.$c | awk '{print $2}')")
+    rows+=("${c}")
+    shopt -u extdebug
+  done
+
+  x_functions="$(construct_column command_comments_parser)"
+
+  lns=()
+  rows=()
+  docs=()
+
+  while IFS= read -r line; do
+    X_FLAGS+=("$(awk '{$1=$1;print $1 $NF}' <<<"$line")")
+  done < <(sed -nr '/.*(--x-[[:alnum:]_-]+[)]+).*/{p;=}' $0 | sed '{N;s/\n/ /}')
+  mapfile -t X_FLAGS < \
+    <(LC_COLLATE=C sort < <(printf "%s\n" "${X_FLAGS[@]}"))
+
+  for c in "${X_FLAGS[@]}"; do
+    lns+=("${c##*)}")
+    rows+=("${c%%)*}")
+  done
+
+  x_options="$(construct_column command_opts_comments_parser)"
+
+  cat <<EOF
+
+$BOLD$UNDERSCORE$(basename $0)$OFF centralizes all relevant project commands.
+
+${BOLD}USAGE:
+    $RED$(basename $0) x.function [--x-option ...] [args]$OFF
+
+${BOLD}x.functions:$OFF
+$(echo "${x_functions}" |
+    sed -E 's/    ([[:alnum:][:punct:]]*)(.*)/    '"$BLUE$BOLD"'\1'"$OFF"'\2''/')
+
+${BOLD}--x-options:$OFF
+$(echo "${x_options}" |
+      sed -E 's/    ([[:alnum:][:punct:]]*)(.*)/    '"$GREEN$BOLD"'\1'"$OFF"'\2''/')
+EOF
+
+)
+
+clean_comment() {
+  tmp="$1"
+  tmp="${tmp//\#/}"
+  comment="${tmp#* }"
+  [[ -z $comment ]] && comment="·"
+  # TODO split in % MAX_COMMENT_LEN lines instead, on spaces only.
+  ((${#comment} > MAX_COMMENT_LEN)) && comment="${comment:0:MAX_COMMENT_LEN}..."
+  echo "$comment"
+}
+
+clean_args() {
+  tmp="$1"
+  tmp="${tmp,,##*args\:}"
+  args="${tmp#* }"
+  echo "$args"
+}
+
+# --------------------- completion and delegation --------------------
+#      `complete -C foo foo` > `source <(foo bloated_completion)`
+
+while IFS= read -r line; do
+  [[ $line =~ ^declare\ -f\ x\. ]] || continue
+  COMMANDS+=("${line##declare -f x.}")
+done < <(declare -F)
+# sort the array. Mimic file input to sort
+mapfile -t COMMANDS < \
+  <(LC_COLLATE=C sort < <(printf "%s\n" "${COMMANDS[@]}"))
+
+if [[ -n $COMP_LINE ]]; then
+  pre="${COMP_LINE##* }" # the part after the last space in the current command
+  cur_commands=(${COMP_LINE%"$pre"})
+
+  for c in "${COMMANDS[@]}"; do
+    if [[ " ${cur_commands[*]} " =~ " ${c} " ]]; then
+      xfn_specified=true
+      break
+    fi
+  done
+
+  for c in "${COMMANDS[@]}"; do
+    test -z "${xfn_specified}" || break
+    test -z "${pre}" -o "${c}" != "${c#"${pre}"}" -a "${pre}" != "${c}" && echo "${c}"
+  done
+
+  test -z "${xfn_specified}" && exit
+
+  # TODO should reuse logic to get them in ``usage``
+  while IFS= read -r line; do
+    x_opts_lines+=("$(awk '{$1=$1;print $1 $NF}' <<<"$line")")
+  done < <(sed -nr '/.*(--x-[[:alnum:]_-]+[)]+).*/{p;=}' $0 | sed '{N;s/\n/ /}')
+  mapfile -t x_opts_lines < \
+    <(LC_COLLATE=C sort < <(printf "%s\n" "${x_opts_lines[@]}"))
+
+  declare __x_opts
+  for c in "${x_opts_lines[@]}"; do
+    __x_opts+=("${c%%)*}")
+  done
+
+  declare -A __x_opts_seen
+  for cmd in "${cur_commands[@]}"; do
+    for opt in ${__x_opts[@]}; do
+      if [[ "$opt" == *"$cmd"* ]]; then
+        __x_opts_seen[$opt]=true
+        break
+      fi
+    done
+  done
+
+  for opt in ${__x_opts[@]}; do
+    [[ -n "${__x_opts_seen[$opt]}" ]] && continue
+    [[ ${opt:0:${#pre}} == "${pre,,}" ]] && echo "${opt}"
+  done
+
+  exit
+fi
+
+# First comment lines automatically added to usage docs.
+for arg in "$@"; do
+  shift
+  case $arg in
+  --x-no-confirmation)
+    # Bypasses confirmation messages.
+    no_confirmation=1
+    ;;
+  *) set -- "$@" "$arg" ;;
+  esac
+done
+
+# handle executing x functions
+if [[ -n "$1" ]]; then
+  declare CMD="$1"
+  shift
+  for c in "${COMMANDS[@]}"; do
+    declare cmd=$(command -v "x.$c")
+    if [[ $c == "$CMD" && -n "$cmd" ]]; then
+      "x.$CMD" "$@"
+      exit $?
+    fi
+  done
+fi
+
+usage
